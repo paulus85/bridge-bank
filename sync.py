@@ -15,14 +15,11 @@ SYNC_HOURS      = int(os.environ.get("SYNC_INTERVAL_HOURS", "6"))
 STATE_FILE      = "/data/state.json"
 EB_API          = "https://api.enablebanking.com"
 NOTIFY_EMAIL    = os.environ.get("NOTIFY_EMAIL", "")
-SMTP_HOST       = os.environ.get("SMTP_HOST", "")
-SMTP_PORT       = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER       = os.environ.get("SMTP_USER", "")
 SMTP_PASS       = os.environ.get("SMTP_PASS", "")
 
-
 def send_email(subject, body):
-    if not all([NOTIFY_EMAIL, SMTP_HOST, SMTP_USER, SMTP_PASS]):
+    if not NOTIFY_EMAIL or not SMTP_USER or not SMTP_PASS:
         return
     import smtplib
     from email.mime.text import MIMEText
@@ -31,7 +28,7 @@ def send_email(subject, body):
     msg["From"]    = SMTP_USER
     msg["To"]      = NOTIFY_EMAIL
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+        with smtplib.SMTP("smtp.mail.me.com", 587) as s:
             s.starttls()
             s.login(SMTP_USER, SMTP_PASS)
             s.sendmail(SMTP_USER, NOTIFY_EMAIL, msg.as_string())
@@ -39,19 +36,16 @@ def send_email(subject, body):
     except Exception as e:
         log.warning("Failed to send email: %s", e)
 
-
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
     return {}
 
-
 def save_state(state):
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
-
 
 def make_headers():
     import jwt, uuid
@@ -59,17 +53,9 @@ def make_headers():
     key_data = open("/data/private.pem", "rb").read()
     key = load_pem_private_key(key_data, password=None)
     now = int(time.time())
-    payload = {
-        "iss": "enablebanking.com",
-        "aud": "api.enablebanking.com",
-        "iat": now,
-        "exp": now + 3600,
-        "jti": str(uuid.uuid4()),
-        "sub": EB_APP_ID,
-    }
+    payload = {"iss": "enablebanking.com", "aud": "api.enablebanking.com", "iat": now, "exp": now + 3600, "jti": str(uuid.uuid4()), "sub": EB_APP_ID}
     token = jwt.encode(payload, key, algorithm="RS256", headers={"kid": EB_APP_ID})
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
 
 def get_session(state):
     sid = state.get("eb_session_id")
@@ -84,32 +70,28 @@ def get_session(state):
     if days_left < 7:
         log.warning("Session expires in %d days. Re-run dosetup.py soon.", days_left)
         send_email(
-            f"Revolut-Actual sync: session expires in {days_left} days",
+            f"Revolut sync: session expires in {days_left} days",
             f"""Your Enable Banking session expires in {days_left} days.
 
 To renew it, SSH into your server and run:
 
-  python3 dosetup.py
+  python3 /opt/docker/revolut-actual/dosetup.py
 
-Then follow the instructions -- open the URL in your browser, approve bank access,
-and paste the redirect URL back in the terminal.
+Then follow the instructions -- open the URL in your browser, approve Revolut access,
+paste the redirect URL back in the terminal.
 
 Finally restart the container:
 
-  docker compose restart
+  docker restart revolut-actual
 
-Done. Next renewal will be in 180 days.
-""",
+Done. Next renewal will be 180 days later.
+"""
         )
     return sid, uid
 
-
 def fetch_transactions(account_uid, date_from):
     headers = make_headers()
-    params = {
-        "date_from": date_from.isoformat(),
-        "date_to": datetime.date.today().isoformat(),
-    }
+    params = {"date_from": date_from.isoformat(), "date_to": datetime.date.today().isoformat()}
     txns = []
     url = f"{EB_API}/accounts/{account_uid}/transactions"
     while url:
@@ -123,13 +105,10 @@ def fetch_transactions(account_uid, date_from):
     log.info("Fetched %d transactions from Enable Banking", len(txns))
     return txns
 
-
 def parse_date(t):
     raw = t.get("transaction_date") or t.get("booking_date") or t.get("value_date")
-    if not raw:
-        raise ValueError("No date in transaction")
+    if not raw: raise ValueError("No date")
     return datetime.date.fromisoformat(raw[:10])
-
 
 def parse_amount(t):
     amt = decimal.Decimal(str((t.get("transaction_amount") or {}).get("amount", "0")))
@@ -140,21 +119,36 @@ def parse_amount(t):
         amt = abs(amt)
     return amt
 
-
 def parse_payee(t):
-    return (
-        (t.get("creditor") or {}).get("name")
-        or (t.get("debtor") or {}).get("name")
-        or t.get("creditor_name")
-        or t.get("debtor_name")
-        or "Unknown"
-    )
-
+    indic = (t.get("credit_debit_indicator") or t.get("credit_debit_indic", "")).upper()
+    own_names = {"david alves", "david adjadj alves"}
+    if indic == "DBIT":
+        # We are paying someone -- the payee is the creditor
+        name = (t.get("creditor") or {}).get("name") or t.get("creditor_name")
+    else:
+        # We are receiving money -- the payee is the debtor (who sent it)
+        name = (t.get("debtor") or {}).get("name") or t.get("debtor_name")
+        # If debtor is ourselves (e.g. card refund), fall back to remittance info
+        if not name or name.lower() in own_names:
+            ri = t.get("remittance_information")
+            if ri and isinstance(ri, list):
+                name = ri[0]
+            elif isinstance(ri, str):
+                name = ri
+    return name or "Unknown"
 
 def parse_notes(t):
     ref = t.get("remittance_information_unstructured")
-    return ref if ref else ""
+    if ref:
+        return ref
+    # remittance_information is a list in Enable Banking
+    ri = t.get("remittance_information")
+    if ri and isinstance(ri, list):
+        return " ".join(ri)
+    return ""
 
+def get_entry_ref(t):
+    return t.get("entry_reference") or t.get("transaction_id") or ""
 
 def run_sync():
     log.info("Starting sync...")
@@ -175,7 +169,7 @@ def run_sync():
     try:
         raw = fetch_transactions(account_uid, date_from)
     except requests.HTTPError as e:
-        log.error("Enable Banking API error: %s", e)
+        log.error("Enable Banking error: %s", e)
         return
 
     if not raw:
@@ -184,16 +178,11 @@ def run_sync():
         save_state(state)
         return
 
-    # pending_map: "date|amount" -> actual transaction id
-    pending_map = state.get("pending_map", {})
+    pending_map  = state.get("pending_map", {})
+    imported_refs = set(state.get("imported_refs", []))  # track confirmed txns by ref
 
     try:
-        with Actual(
-            base_url=ACTUAL_URL,
-            password=ACTUAL_PASSWORD,
-            file=ACTUAL_SYNC_ID,
-            data_dir="/data/actual-cache",
-        ) as actual:
+        with Actual(base_url=ACTUAL_URL, password=ACTUAL_PASSWORD, file=ACTUAL_SYNC_ID, data_dir="/data/actual-cache") as actual:
             account = get_or_create_account(actual.session, ACTUAL_ACCOUNT)
             existing = list(get_transactions(actual.session, account=account))
             already_matched = existing[:]
@@ -206,59 +195,64 @@ def run_sync():
                     amount = parse_amount(txn)
                     payee  = parse_payee(txn)
                     notes  = parse_notes(txn)
+                    ref    = get_entry_ref(txn)
                     key    = f"{date}|{amount}"
 
-                    log.debug("Txn: %s | %s | %s | %s", status, date, amount, payee)
+                    log.info("Txn: %s | %s | %s | %s", status, date, amount, payee)
 
                     if status == "PDNG":
-                        # Import as uncleared if not already tracked
                         if key not in pending_map:
                             t = reconcile_transaction(
                                 actual.session, date, account, payee, notes,
-                                None, amount, cleared=False, already_matched=already_matched,
+                                None, amount, cleared=False, already_matched=already_matched
                             )
                             already_matched.append(t)
                             if t.changed():
                                 pending_map[key] = str(t.id)
                                 added += 1
-                                log.info("Pending imported: %s | %s | %s", date, amount, payee)
+                                log.info("Imported pending: %s | %s | %s", date, amount, payee)
                             else:
                                 skipped += 1
                         else:
                             skipped += 1
 
                     else:  # BOOK = confirmed
+                        # Skip if we already imported this exact transaction
+                        if ref and ref in imported_refs:
+                            skipped += 1
+                            log.info("Skipped already-imported: %s | %s | %s", date, amount, payee)
+                            continue
+
                         if key in pending_map:
-                            # Match the pending transaction and mark it cleared
                             txn_id = pending_map[key]
-                            existing_txn = next(
-                                (t for t in existing if str(t.id) == txn_id), None
-                            )
+                            existing_txn = next((t for t in existing if str(t.id) == txn_id), None)
                             if existing_txn:
                                 existing_txn.cleared = True
-                                if payee and payee != "Unknown":
-                                    existing_txn.payee_name = payee
                                 del pending_map[key]
+                                if ref:
+                                    imported_refs.add(ref)
                                 updated += 1
-                                log.info("Pending confirmed: %s | %s | %s", date, amount, payee)
+                                log.info("Confirmed pending: %s | %s | %s", date, amount, payee)
                             else:
-                                # Was deleted manually in Actual -- import fresh
                                 del pending_map[key]
                                 t = reconcile_transaction(
                                     actual.session, date, account, payee, notes,
-                                    None, amount, cleared=True, already_matched=already_matched,
+                                    None, amount, cleared=True, already_matched=already_matched
                                 )
                                 already_matched.append(t)
                                 if t.changed():
+                                    if ref:
+                                        imported_refs.add(ref)
                                     added += 1
                         else:
-                            # Normal confirmed transaction
                             t = reconcile_transaction(
                                 actual.session, date, account, payee, notes,
-                                None, amount, cleared=True, already_matched=already_matched,
+                                None, amount, cleared=True, already_matched=already_matched
                             )
                             already_matched.append(t)
                             if t.changed():
+                                if ref:
+                                    imported_refs.add(ref)
                                 added += 1
                             else:
                                 skipped += 1
@@ -270,13 +264,13 @@ def run_sync():
             log.info("Done: %d added, %d confirmed, %d skipped", added, updated, skipped)
 
     except Exception as e:
-        log.error("Actual Budget error: %s", e)
+        log.error("Actual error: %s", e)
         return
 
     state["last_sync_date"] = datetime.date.today().isoformat()
     state["pending_map"] = pending_map
+    state["imported_refs"] = list(imported_refs)
     save_state(state)
-
 
 if __name__ == "__main__":
     log.info("Starting scheduler (every %dh)", SYNC_HOURS)
