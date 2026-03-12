@@ -138,7 +138,8 @@ def parse_payee(t):
         if not name:
             ri = t.get("remittance_information")
             if ri and isinstance(ri, list):
-                name = ri[0]
+                # Fix for Credit Agricole FR
+                name = ri[1]
             elif isinstance(ri, str):
                 name = ri
     else:
@@ -148,7 +149,8 @@ def parse_payee(t):
         if not name or (OWN_NAMES and name.lower() in OWN_NAMES):
             ri = t.get("remittance_information")
             if ri and isinstance(ri, list):
-                name = ri[0]
+                # Fix for Credit Agricole FR
+                name = ri[1]
             elif isinstance(ri, str):
                 name = ri
     return name or "Unknown"
